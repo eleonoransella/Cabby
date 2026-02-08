@@ -53,6 +53,7 @@ class CallSession:
         self.elevenlabs_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.is_active = True
         self.streaming_ready = False  # Wait for streaming.started before sending audio
+        self.context = {}  # Store context from webhooks
     
     @staticmethod
     def mulaw_to_pcm(mulaw_data: bytes) -> np.ndarray:
@@ -128,12 +129,18 @@ class CallSession:
         
         # Initialize the conversation with μ-law 8000 Hz for both input AND output
         print(f"📣 Initializing ElevenLabs conversation with μ-law 8kHz (input + output)...")
+        
+        # Build system prompt with context if available
+        system_prompt = ""
+        if self.context:
+            system_prompt = f"CONTEXT INFORMATION:\n{json.dumps(self.context, indent=2)}\n\nUse this context to assist the caller."
+        
         init_message = {
             "type": "conversation_initiation_client_data",
             "conversation_config_override": {
                 "agent": {
                     "prompt": {
-                        "prompt": ""  # Use agent's default prompt
+                        "prompt": system_prompt  # Include context in agent prompt
                     }
                 },
                 "tts": {
@@ -388,6 +395,71 @@ async def make_call(to_number: str, from_number: str):
         }
     else:
         raise HTTPException(status_code=response.status_code, detail=response.text)
+
+
+@app.post("/webhook/context/{call_control_id}")
+async def receive_context(call_control_id: str, context: dict):
+    """
+    Webhook endpoint for external systems to provide context to active calls
+    
+    Example payload:
+    {
+        "inquiry": "Customer wants to book a ride",
+        "customer_name": "John Doe",
+        "pickup_location": "123 Main St",
+        "destination": "Airport",
+        "special_requests": "Need wheelchair accessible vehicle"
+    }
+    """
+    if call_control_id not in active_calls:
+        raise HTTPException(status_code=404, detail="Call not found or already ended")
+    
+    # Update the call's context
+    session = active_calls[call_control_id]
+    session.context.update(context)
+    
+    print(f"📥 Received context for call {call_control_id}:")
+    print(f"   {context}")
+    
+    # Optionally: Send context to ElevenLabs as a message
+    if session.elevenlabs_ws:
+        try:
+            # Format context as a system message to the AI
+            context_message = f"[SYSTEM UPDATE] New information received: {json.dumps(context)}"
+            
+            # Send as text input to ElevenLabs
+            await session.elevenlabs_ws.send(json.dumps({
+                "type": "text",
+                "text": context_message
+            }))
+            
+            print(f"✅ Context forwarded to AI agent")
+        except Exception as e:
+            print(f"⚠️  Could not forward context to AI: {e}")
+    
+    return {
+        "status": "success",
+        "call_control_id": call_control_id,
+        "context_received": context
+    }
+
+
+@app.get("/calls/active")
+async def list_active_calls():
+    """List all active calls with their IDs"""
+    calls = []
+    for call_id, session in active_calls.items():
+        calls.append({
+            "call_control_id": call_id,
+            "is_active": session.is_active,
+            "streaming_ready": session.streaming_ready,
+            "context": session.context
+        })
+    
+    return {
+        "active_calls": len(calls),
+        "calls": calls
+    }
 
 
 @app.post("/webhooks/telnyx")
